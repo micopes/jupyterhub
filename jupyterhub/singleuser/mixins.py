@@ -51,7 +51,9 @@ from ..utils import (
     exponential_backoff,
     isoformat,
     make_ssl_context,
+    maybe_future,
     url_path_join,
+    utcnow,
 )
 from ._decorator import allow_unauthenticated
 from ._disable_user_config import _disable_user_config, _exclude_home
@@ -467,11 +469,45 @@ class SingleUserNotebookAppMixin(Configurable):
         else:
             return 300
 
+    busy_kernels_are_active = Bool(
+        False,
+        config=True,
+        help="""
+        Whether a kernel that is busy executing counts as current activity.
+
+        When enabled, the server reports the current time as its last activity
+        to the Hub for as long as any kernel is in the 'busy' execution state,
+        so that long-running executions that produce no output
+        are not considered idle.
+
+        Uses `$JUPYTERHUB_BUSY_KERNELS_ARE_ACTIVE` environment variable by default.
+        """,
+    )
+
+    @default('busy_kernels_are_active')
+    def _default_busy_kernels_are_active(self):
+        return _bool_env('JUPYTERHUB_BUSY_KERNELS_ARE_ACTIVE')
+
+    async def _any_kernel_busy(self):
+        """Return True if any running kernel is in the 'busy' execution state"""
+        kernel_manager = getattr(self, 'kernel_manager', None)
+        if kernel_manager is None:
+            return False
+        try:
+            kernels = await maybe_future(kernel_manager.list_kernels())
+        except Exception as e:
+            self.log.debug("Failed to check for busy kernels: %s", e)
+            return False
+        return any(kernel.get('execution_state') == 'busy' for kernel in kernels)
+
     _last_activity_sent = Any(allow_none=True)
 
     async def notify_activity(self):
         """Notify jupyterhub of activity"""
         last_activity = self.web_app.last_activity()
+        if self.busy_kernels_are_active and await self._any_kernel_busy():
+            self.log.debug("A kernel is busy, reporting current activity to the Hub")
+            last_activity = utcnow()
         if not last_activity:
             self.log.debug("No activity to send to the Hub")
             return

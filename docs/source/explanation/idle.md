@@ -161,6 +161,8 @@ Sources of kernel activity:
 - starting or restarting a kernel
 - interrupts of the kernel
 
+(kernel-activity-busy)=
+
 ### Configuring kernel activity
 
 Jupyter Server's [MappingKernelManager](inv:jupyter-server#*.MappingKernelManager) defines some options for configuring how kernels are considered "idle" and available for culling.
@@ -182,8 +184,21 @@ You can tune these to suit your needs via options on `MappingKernelManager` in y
   By default, whenever a kernel processes a message from the client (such as an execution or introspection),
   it will be treated as activity.
 
-Busy and connected kernels, if they are not producing message events, do _not_ contribute to the overall `last_activity`.
+Busy and connected kernels, if they are not producing message events, do _not_ contribute to the overall `last_activity` by default.
 Those signals are only taken into account by the server's internal kernel culler.
+
+If you want a server to stay active for as long as it is executing code, even when that execution produces no output,
+enable [`busy_kernels_are_active`](#JupyterHubSingleUser.busy_kernels_are_active) in the single-user server
+(or set `JUPYTERHUB_BUSY_KERNELS_ARE_ACTIVE=1` in the server's environment, e.g. via `Spawner.environment`):
+
+```python
+c.JupyterHubSingleUser.busy_kernels_are_active = True
+```
+
+With this enabled, the server reports current activity to JupyterHub while any kernel is busy,
+so a long-running execution is not culled as idle.
+Note that a kernel that never leaves the busy state (e.g. a forgotten infinite loop) then keeps the server active indefinitely,
+so this is best combined with a maximum server age in your idle culler.
 
 Tips for more aggressive culling:
 
@@ -336,3 +351,7 @@ If you have started a long-running task that you want to keep going, there are a
 [jupyter-keepalive](https://github.com/minrk/jupyter-keepalive) is an Extension that relies on Jupyter Server's extensible last_activity sources which provides a mechanism for users to ensure that a server will be considered 'active' for some interval.
 This avoids the need to try to somehow trigger other forms of activity to keep a server alive,
 such as running a pointless execution or leaving a browser open overnight.
+
+If the long-running task is a kernel execution, deployments can also opt in to treating busy kernels as activity
+with [`busy_kernels_are_active`](#JupyterHubSingleUser.busy_kernels_are_active), as described in [](#kernel-activity-busy),
+so that running code keeps the server alive without any action from the user.

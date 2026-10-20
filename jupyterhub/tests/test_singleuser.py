@@ -1,27 +1,40 @@
 """Tests for jupyterhub.singleuser"""
 
 import asyncio
+import json
 import os
 import sys
+import uuid
 import warnings
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from pprint import pprint
 from subprocess import CalledProcessError, check_output
+from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
 import pytest
 from bs4 import BeautifulSoup
+from dateutil.parser import parse as parse_date
+from tornado.httpclient import HTTPRequest
+from tornado.websocket import websocket_connect
 
 import jupyterhub
 
 from .. import orm
-from ..utils import url_path_join
+from ..utils import url_path_join, utcnow
 from .mocking import public_url
 from .utils import AsyncSession, async_requests, get_page
 
 IS_JUPYVERSE = os.environ.get("JUPYTERHUB_SINGLEUSER_APP") == "jupyverse"
+
+try:
+    from ..singleuser.extension import JupyterHubSingleUser
+except ImportError:
+    # the server extension requires jupyter_server 2
+    JupyterHubSingleUser = None
 
 
 pytestmark = pytest.mark.ssl
@@ -515,3 +528,120 @@ async def test_singleuser_activity(app, user, full_spawn, no_proxy_activity):
             break
     assert user.last_activity > before_activity_user
     assert user.spawner.last_activity > before_activity_spawner
+
+
+@pytest.mark.skipif(
+    JupyterHubSingleUser is None, reason="requires the jupyter_server 2 extension"
+)
+@pytest.mark.parametrize("busy_kernels_are_active", [True, False])
+@pytest.mark.parametrize("execution_state", ["busy", "idle"])
+async def test_notify_activity_busy_kernels(busy_kernels_are_active, execution_state):
+    """A busy kernel is reported as current activity only when opted in"""
+    ext = JupyterHubSingleUser(busy_kernels_are_active=busy_kernels_are_active)
+    ext.hub_activity_url = "http://127.0.0.1:8081/hub/api/users/name/activity"
+    stale = utcnow() - timedelta(hours=1)
+    ext.serverapp = SimpleNamespace(
+        web_app=SimpleNamespace(last_activity=lambda: stale),
+        kernel_manager=SimpleNamespace(
+            list_kernels=lambda: [{"execution_state": execution_state}]
+        ),
+    )
+    posted = []
+
+    async def fake_fetch(url, **kwargs):
+        posted.append(json.loads(kwargs["data"]))
+
+    with mock.patch("jupyterhub.singleuser.extension.fetch", fake_fetch):
+        await ext.notify_activity()
+
+    assert len(posted) == 1
+    reported = parse_date(posted[0]["last_activity"])
+    if busy_kernels_are_active and execution_state == "busy":
+        assert reported > stale
+        assert utcnow() - reported < timedelta(minutes=1)
+    else:
+        assert abs(reported - stale) < timedelta(seconds=1)
+
+
+@pytest.mark.skipif(IS_JUPYVERSE, reason="jupyverse doesn't track activity")
+@pytest.mark.parametrize("busy_kernels_are_active", [True, False])
+async def test_singleuser_activity_busy_kernel(
+    app, user, full_spawn, no_proxy_activity, busy_kernels_are_active
+):
+    """A silently busy kernel keeps the server active only when opted in"""
+    token = user.new_api_token(scopes=[f"access:servers!server={user.name}/"])
+    user.spawner.environment["JUPYTERHUB_ACTIVITY_INTERVAL"] = "1"
+    user.spawner.environment["JUPYTERHUB_BUSY_KERNELS_ARE_ACTIVE"] = (
+        "1" if busy_kernels_are_active else "0"
+    )
+    await user.spawn()
+    await app.proxy.add_user(user)
+    headers = {"Authorization": f"Bearer {token}"}
+    base_url = public_url(app, user)
+
+    # start a kernel
+    r = await async_requests.post(
+        url_path_join(base_url, "api/kernels"), headers=headers, json={}
+    )
+    r.raise_for_status()
+    kernel_id = r.json()["id"]
+    kernel_url = url_path_join(base_url, "api", "kernels", kernel_id)
+
+    # run a long execution that produces no output
+    ws_url = "ws" + url_path_join(kernel_url, "channels")[len("http") :]
+    ws = await websocket_connect(HTTPRequest(ws_url, headers=headers))
+    await ws.write_message(
+        json.dumps(
+            {
+                "channel": "shell",
+                "header": {
+                    "msg_id": uuid.uuid4().hex,
+                    "msg_type": "execute_request",
+                    "session": uuid.uuid4().hex,
+                    "username": "",
+                    "version": "5.3",
+                    "date": utcnow().isoformat(),
+                },
+                "parent_header": {},
+                "metadata": {},
+                "buffers": [],
+                "content": {
+                    "code": "import time; time.sleep(300)",
+                    "silent": False,
+                    "store_history": False,
+                    "allow_stdin": False,
+                    "stop_on_error": True,
+                },
+            }
+        )
+    )
+
+    # wait for the kernel to report busy,
+    # without these requests counting as activity
+    for _ in range(100):
+        r = await async_requests.get(
+            kernel_url + "?no_track_activity=1", headers=headers
+        )
+        r.raise_for_status()
+        if r.json()["execution_state"] == "busy":
+            break
+        await asyncio.sleep(0.1)
+    else:
+        pytest.fail("kernel never became busy")
+
+    # let the activity from starting the kernel and the execution be reported,
+    # then check whether activity keeps being reported while the kernel is busy
+    await asyncio.sleep(3)
+    before = user.spawner.last_activity
+    await asyncio.sleep(3)
+    after = user.spawner.last_activity
+
+    ws.close()
+    r = await async_requests.delete(kernel_url, headers=headers)
+    r.raise_for_status()
+    await user.stop()
+
+    if busy_kernels_are_active:
+        assert after > before
+    else:
+        assert after == before

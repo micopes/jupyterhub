@@ -35,6 +35,7 @@ from urllib.parse import urlparse
 from jupyter_server.auth import Authorizer, IdentityProvider, User
 from jupyter_server.auth.logout import LogoutHandler
 from jupyter_server.extension.application import ExtensionApp
+from jupyter_server.utils import ensure_async
 from tornado.httputil import url_concat
 from tornado.web import HTTPError
 from traitlets import Any, Bool, Dict, Instance, Integer, Unicode, default
@@ -49,6 +50,7 @@ from jupyterhub.utils import (
     isoformat,
     make_ssl_context,
     url_path_join,
+    utcnow,
 )
 
 from ._decorator import allow_unauthenticated
@@ -426,11 +428,56 @@ class JupyterHubSingleUser(ExtensionApp):
         else:
             return 300
 
+    busy_kernels_are_active = Bool(
+        False,
+        config=True,
+        help="""
+        Whether a kernel that is busy executing counts as current activity.
+
+        By default, kernel activity is only recorded when the kernel sends
+        messages (e.g. output or status changes). A long-running execution
+        that produces no output therefore stops registering as activity,
+        and the server may be considered idle and culled
+        (e.g. by jupyterhub-idle-culler) while it is still running code.
+
+        When enabled, the server reports the current time as its last activity
+        to the Hub for as long as any kernel is in the 'busy' execution state.
+
+        .. warning::
+
+            A kernel that never leaves the busy state
+            (e.g. a forgotten infinite loop) will keep the server active
+            indefinitely. Consider combining this with a maximum server age
+            in your idle culler.
+
+        Uses `$JUPYTERHUB_BUSY_KERNELS_ARE_ACTIVE` environment variable by default.
+        """,
+    )
+
+    @default('busy_kernels_are_active')
+    def _default_busy_kernels_are_active(self):
+        return _bool_env('JUPYTERHUB_BUSY_KERNELS_ARE_ACTIVE')
+
+    async def _any_kernel_busy(self):
+        """Return True if any running kernel is in the 'busy' execution state"""
+        kernel_manager = getattr(self.serverapp, 'kernel_manager', None)
+        if kernel_manager is None:
+            return False
+        try:
+            kernels = await ensure_async(kernel_manager.list_kernels())
+        except Exception as e:
+            self.log.debug("Failed to check for busy kernels: %s", e)
+            return False
+        return any(kernel.get('execution_state') == 'busy' for kernel in kernels)
+
     _last_activity_sent = Any(allow_none=True)
 
     async def notify_activity(self):
         """Notify jupyterhub of activity"""
         last_activity = self.serverapp.web_app.last_activity()
+        if self.busy_kernels_are_active and await self._any_kernel_busy():
+            self.log.debug("A kernel is busy, reporting current activity to the Hub")
+            last_activity = utcnow()
         if not last_activity:
             self.log.debug("No activity to send to the Hub")
             return
